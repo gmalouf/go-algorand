@@ -516,6 +516,11 @@ type ConsensusParams struct {
 	// used by agreement for Circulation, and updates the calculation of StateProofOnlineTotalWeight used
 	// by state proofs to use the same method (rather than excluding stake from the top N stakeholders as before).
 	ExcludeExpiredCirculation bool
+
+	// Maximum amount of stake that a single account can participate with. Balances higher than this in a given
+	// round will be capped to this value when calculating the participating stake for the account along with the
+	// total online stake.
+	MaxAccountParticipatingStake uint64
 }
 
 // PaysetCommitType enumerates possible ways for the block header to commit to
@@ -1362,6 +1367,8 @@ func initConsensusProtocols() {
 	vFuture.LogicSigVersion = 10 // When moving this to a release, put a new higher LogicSigVersion here
 	vFuture.EnableLogicSigCostPooling = true
 
+	// Sets max participating stake to 100,000,000 Algos aka (100,000,000 * 10^6 microAlgos)
+	vFuture.MaxAccountParticipatingStake = 100000000000000
 	Consensus[protocol.ConsensusFuture] = vFuture
 
 	// vAlphaX versions are an separate series of consensus parameters and versions for alphanet
