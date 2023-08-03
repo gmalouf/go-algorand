@@ -211,10 +211,15 @@ func (l *testLedger) Circulation(r basics.Round, voteRnd basics.Round) (basics.M
 		panic(err)
 	}
 
+	ver, err := l.ConsensusVersion(r)
+	if err == nil {
+		return basics.MicroAlgos{}, err
+	}
+
 	var sum basics.MicroAlgos
 	var overflowed bool
 	for _, rec := range l.state {
-		sum, overflowed = basics.OAddA(sum, rec.OnlineAccountData().VotingStake())
+		sum, overflowed = basics.OAddA(sum, rec.OnlineAccountData().VotingStake(config.Consensus[ver]))
 		if overflowed {
 			panic("circulation computation overflowed")
 		}

@@ -549,7 +549,11 @@ func (u AccountData) OnlineAccountData() OnlineAccountData {
 // VotingStake returns the amount of MicroAlgos associated with the user's account
 // for the purpose of participating in the Algorand protocol.  It assumes the
 // caller has already updated rewards appropriately using WithUpdatedRewards().
-func (u OnlineAccountData) VotingStake() MicroAlgos {
+func (u OnlineAccountData) VotingStake(proto config.ConsensusParams) MicroAlgos {
+	if proto.MaxAccountParticipatingStake != 0 && u.MicroAlgosWithRewards.Raw > proto.MaxAccountParticipatingStake {
+		return MicroAlgos{Raw: proto.MaxAccountParticipatingStake}
+	}
+
 	return u.MicroAlgosWithRewards
 }
 

@@ -95,7 +95,7 @@ func (cred UnauthenticatedCredential) Verify(proto config.ConsensusParams, m Mem
 	}
 
 	var weight uint64
-	userMoney := m.Record.VotingStake()
+	userMoney := m.Record.VotingStake(proto)
 	expectedSelection := float64(m.Selector.CommitteeSize(proto))
 
 	if m.TotalMoney.Raw < userMoney.Raw {
