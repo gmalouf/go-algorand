@@ -172,6 +172,72 @@ type AssetResourceRecord struct {
 	Holding AssetHoldingDelta
 }
 
+// GetValue returns the asset holding pointer (nil if not set).
+func (d AssetHoldingDelta) GetValue() *basics.AssetHolding { return d.Holding }
+
+// IsDeleted reports whether this delta represents a deletion.
+func (d AssetHoldingDelta) IsDeleted() bool { return d.Deleted }
+
+// GetValue returns the asset params pointer (nil if not set).
+func (d AssetParamsDelta) GetValue() *basics.AssetParams { return d.Params }
+
+// IsDeleted reports whether this delta represents a deletion.
+func (d AssetParamsDelta) IsDeleted() bool { return d.Deleted }
+
+// GetValue returns the app local state pointer (nil if not set).
+func (d AppLocalStateDelta) GetValue() *basics.AppLocalState { return d.LocalState }
+
+// IsDeleted reports whether this delta represents a deletion.
+func (d AppLocalStateDelta) IsDeleted() bool { return d.Deleted }
+
+// GetValue returns the app params pointer (nil if not set).
+func (d AppParamsDelta) GetValue() *basics.AppParams { return d.Params }
+
+// IsDeleted reports whether this delta represents a deletion.
+func (d AppParamsDelta) IsDeleted() bool { return d.Deleted }
+
+// GetAddress returns the address associated with this record.
+func (r AssetResourceRecord) GetAddress() basics.Address { return r.Addr }
+
+// GetCreatableIndex returns the asset index as a CreatableIndex.
+func (r AssetResourceRecord) GetCreatableIndex() basics.CreatableIndex {
+	return basics.CreatableIndex(r.Aidx)
+}
+
+// GetHoldingValue returns the asset holding from the delta.
+func (r AssetResourceRecord) GetHoldingValue() *basics.AssetHolding {
+	return r.Holding.GetValue()
+}
+
+// IsHoldingDeleted reports whether the holding was deleted.
+func (r AssetResourceRecord) IsHoldingDeleted() bool { return r.Holding.IsDeleted() }
+
+// GetParamsValue returns the asset params from the delta.
+func (r AssetResourceRecord) GetParamsValue() *basics.AssetParams { return r.Params.GetValue() }
+
+// IsParamsDeleted reports whether the params were deleted.
+func (r AssetResourceRecord) IsParamsDeleted() bool { return r.Params.IsDeleted() }
+
+// GetAddress returns the address associated with this record.
+func (r AppResourceRecord) GetAddress() basics.Address { return r.Addr }
+
+// GetCreatableIndex returns the app index as a CreatableIndex.
+func (r AppResourceRecord) GetCreatableIndex() basics.CreatableIndex {
+	return basics.CreatableIndex(r.Aidx)
+}
+
+// GetHoldingValue returns the app local state from the delta.
+func (r AppResourceRecord) GetHoldingValue() *basics.AppLocalState { return r.State.GetValue() }
+
+// IsHoldingDeleted reports whether the local state was deleted.
+func (r AppResourceRecord) IsHoldingDeleted() bool { return r.State.IsDeleted() }
+
+// GetParamsValue returns the app params from the delta.
+func (r AppResourceRecord) GetParamsValue() *basics.AppParams { return r.Params.GetValue() }
+
+// IsParamsDeleted reports whether the params were deleted.
+func (r AppResourceRecord) IsParamsDeleted() bool { return r.Params.IsDeleted() }
+
 // AccountDeltas stores ordered accounts and allows fast lookup by address
 // One key design aspect here was to ensure that we're able to access the written
 // deltas in a deterministic order, while maintaining O(1) lookup. In order to

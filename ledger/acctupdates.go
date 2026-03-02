@@ -1218,12 +1218,82 @@ func (au *accountUpdates) lookupResource(rnd basics.Round, addr basics.Address, 
 	}
 }
 
+// resourceDeltaRecord is a generic constraint satisfied by both
+// AssetResourceRecord and AppResourceRecord, providing uniform access
+// to delta fields regardless of the concrete resource type.
+type resourceDeltaRecord[H, P any] interface {
+	GetAddress() basics.Address
+	GetCreatableIndex() basics.CreatableIndex
+	GetHoldingValue() *H
+	IsHoldingDeleted() bool
+	GetParamsValue() *P
+	IsParamsDeleted() bool
+}
+
+// resourceAdapter bridges lookupResources with the concrete delta slice and
+// DB getters for a given resource type. These live in this package because
+// ledgercore cannot import trackerdb (circular dependency).
+type resourceAdapter[H, P any, R resourceDeltaRecord[H, P]] interface {
+	Records(*ledgercore.AccountDeltas) []R
+	DBHolding(*trackerdb.ResourcesData) *H
+	DBParams(*trackerdb.ResourcesData) *P
+}
+
+type resourceResult[H, P any] struct {
+	id      basics.CreatableIndex
+	creator basics.Address
+	holding *H
+	params  *P
+}
+
+type assetResourceAdapter struct{}
+
+func (assetResourceAdapter) Records(ad *ledgercore.AccountDeltas) []ledgercore.AssetResourceRecord {
+	return ad.AssetResources
+}
+func (assetResourceAdapter) DBHolding(rd *trackerdb.ResourcesData) *basics.AssetHolding {
+	ah := rd.GetAssetHolding()
+	return &ah
+}
+func (assetResourceAdapter) DBParams(rd *trackerdb.ResourcesData) *basics.AssetParams {
+	ap := rd.GetAssetParams()
+	return &ap
+}
+
+type appResourceAdapter struct{}
+
+func (appResourceAdapter) Records(ad *ledgercore.AccountDeltas) []ledgercore.AppResourceRecord {
+	return ad.AppResources
+}
+func (appResourceAdapter) DBHolding(rd *trackerdb.ResourcesData) *basics.AppLocalState {
+	als := rd.GetAppLocalState()
+	return &als
+}
+func (appResourceAdapter) DBParams(rd *trackerdb.ResourcesData) *basics.AppParams {
+	ap := rd.GetAppParams()
+	return &ap
+}
+
 // lookupAssetResources returns all the asset resources for a given address,
 // merging in-memory deltas with persisted data to provide current-round information.
 func (au *accountUpdates) lookupAssetResources(addr basics.Address, assetIDGT basics.AssetIndex, limit uint64) ([]ledgercore.AssetResourceWithIDs, basics.Round, error) {
-	return lookupResources(au, addr, basics.CreatableIndex(assetIDGT), limit, basics.AssetCreatable,
-		extractAssetDeltas, mergeAssetResult,
-		func(r ledgercore.AssetResourceWithIDs) basics.CreatableIndex { return basics.CreatableIndex(r.AssetID) })
+	results, rnd, err := lookupResources(au, addr, basics.CreatableIndex(assetIDGT),
+		limit, basics.AssetCreatable, true, assetResourceAdapter{})
+	if err != nil {
+		return nil, rnd, err
+	}
+	out := make([]ledgercore.AssetResourceWithIDs, len(results))
+	for i, r := range results {
+		out[i] = ledgercore.AssetResourceWithIDs{
+			AssetID: basics.AssetIndex(r.id),
+			Creator: r.creator,
+			AssetResource: ledgercore.AssetResource{
+				AssetHolding: r.holding,
+				AssetParams:  r.params,
+			},
+		}
+	}
+	return out, rnd, nil
 }
 
 // lookupApplicationResources returns all the application resources for a given address,
@@ -1231,34 +1301,38 @@ func (au *accountUpdates) lookupAssetResources(addr basics.Address, assetIDGT ba
 // If includeParams is false, AppParams will not be populated to save memory allocations
 // (app params can be ~50KB each).
 func (au *accountUpdates) lookupApplicationResources(addr basics.Address, appIDGT basics.AppIndex, limit uint64, includeParams bool) ([]ledgercore.AppResourceWithIDs, basics.Round, error) {
-	return lookupResources(au, addr, basics.CreatableIndex(appIDGT), limit, basics.AppCreatable,
-		extractAppDeltas, mergeAppResult(includeParams),
-		func(r ledgercore.AppResourceWithIDs) basics.CreatableIndex { return basics.CreatableIndex(r.AppID) })
-}
-
-// resourceDeltaEntry is a type-erased representation of a single resource's
-// delta state, used by lookupResources to unify the asset and app lookup paths.
-type resourceDeltaEntry struct {
-	holdingOrState any  // *basics.AssetHolding or *basics.AppLocalState
-	holdingDeleted bool
-	params         any  // *basics.AssetParams or *basics.AppParams
-	paramsDeleted  bool
+	results, rnd, err := lookupResources(au, addr, basics.CreatableIndex(appIDGT),
+		limit, basics.AppCreatable, includeParams, appResourceAdapter{})
+	if err != nil {
+		return nil, rnd, err
+	}
+	out := make([]ledgercore.AppResourceWithIDs, len(results))
+	for i, r := range results {
+		out[i] = ledgercore.AppResourceWithIDs{
+			AppID:   basics.AppIndex(r.id),
+			Creator: r.creator,
+			AppResource: ledgercore.AppResource{
+				AppLocalState: r.holding,
+				AppParams:     r.params,
+			},
+		}
+	}
+	return out, rnd, nil
 }
 
 // lookupResources performs a paginated lookup of resources (assets or apps) for
 // a single address, merging in-memory deltas with persisted DB data. It follows
 // the lock / delta-walk / DB-query / retry pattern used by the other lookup
 // methods in this file (lookupWithoutRewards, lookupResource, etc.).
-func lookupResources[T any](
+func lookupResources[H, P any, R resourceDeltaRecord[H, P], A resourceAdapter[H, P, R]](
 	au *accountUpdates,
 	addr basics.Address,
 	idGT basics.CreatableIndex,
 	limit uint64,
 	ctype basics.CreatableType,
-	extractDeltas func(*ledgercore.AccountDeltas, basics.Address, basics.CreatableIndex, map[basics.CreatableIndex]resourceDeltaEntry) int,
-	mergeResult func(basics.CreatableIndex, *trackerdb.PersistedResourcesDataWithCreator, *resourceDeltaEntry, basics.Address) (T, bool),
-	getID func(T) basics.CreatableIndex,
-) ([]T, basics.Round, error) {
+	includeParams bool,
+	adapter A,
+) ([]resourceResult[H, P], basics.Round, error) {
 	if limit == 0 {
 		return nil, basics.Round(0), nil
 	}
@@ -1275,14 +1349,29 @@ func lookupResources[T any](
 		currentDBRound := au.cachedDBRound
 		currentDeltaLen := len(au.deltas)
 
-		deltaMap := make(map[basics.CreatableIndex]resourceDeltaEntry)
+		deltaMap := make(map[basics.CreatableIndex]R)
 		numDeltaDeleted := 0
 
 		// Walk deltas backwards so the first entry found per resource is the
 		// most recent. Uses the same loop idiom as lookupWithoutRewards et al.
 		for offset := currentDeltaLen; offset > 0; {
 			offset--
-			numDeltaDeleted += extractDeltas(&au.deltas[offset].Accts, addr, idGT, deltaMap)
+			for _, rec := range adapter.Records(&au.deltas[offset].Accts) {
+				if rec.GetAddress() != addr {
+					continue
+				}
+				id := rec.GetCreatableIndex()
+				if id <= idGT {
+					continue
+				}
+				if _, ok := deltaMap[id]; ok {
+					continue
+				}
+				deltaMap[id] = rec
+				if rec.IsHoldingDeleted() {
+					numDeltaDeleted++
+				}
+			}
 		}
 
 		retRound := currentDBRound + basics.Round(currentDeltaLen)
@@ -1301,7 +1390,7 @@ func lookupResources[T any](
 
 		if resourceDbRound == currentDBRound {
 			seenInDB := make(map[basics.CreatableIndex]bool, len(persistedResources))
-			result := make([]T, 0, limit)
+			result := make([]resourceResult[H, P], 0, limit)
 
 			// Determine the upper bound of the DB page so we only inject
 			// delta-only entries within range (avoiding next-token gaps).
@@ -1317,12 +1406,33 @@ func lookupResources[T any](
 				seenInDB[pd.Aidx] = true
 
 				d, inDelta := deltaMap[pd.Aidx]
-				var dp *resourceDeltaEntry
-				if inDelta {
-					dp = &d
+				var r resourceResult[H, P]
+				r.id = pd.Aidx
+
+				if inDelta && d.IsHoldingDeleted() {
+					// Holding/state removed by delta.
+				} else if inDelta && d.GetHoldingValue() != nil {
+					r.holding = d.GetHoldingValue()
+				} else {
+					r.holding = adapter.DBHolding(&pd.Data)
 				}
-				if entry, live := mergeResult(pd.Aidx, pd, dp, addr); live {
-					result = append(result, entry)
+
+				if inDelta && d.IsParamsDeleted() {
+					// Params removed by delta.
+				} else if inDelta && d.GetParamsValue() != nil {
+					r.creator = pd.Creator
+					if includeParams {
+						r.params = d.GetParamsValue()
+					}
+				} else if !pd.Creator.IsZero() {
+					r.creator = pd.Creator
+					if includeParams {
+						r.params = adapter.DBParams(&pd.Data)
+					}
+				}
+
+				if r.holding != nil || r.params != nil {
+					result = append(result, r)
 				}
 			}
 
@@ -1336,13 +1446,24 @@ func lookupResources[T any](
 				if dbHasMore && id > dbMaxID {
 					continue
 				}
-				if entry, live := mergeResult(id, nil, &d, addr); live {
-					result = append(result, entry)
+				var r resourceResult[H, P]
+				r.id = id
+				if !d.IsHoldingDeleted() && d.GetHoldingValue() != nil {
+					r.holding = d.GetHoldingValue()
+				}
+				if !d.IsParamsDeleted() && d.GetParamsValue() != nil {
+					r.creator = addr
+					if includeParams {
+						r.params = d.GetParamsValue()
+					}
+				}
+				if r.holding != nil || r.params != nil {
+					result = append(result, r)
 				}
 			}
 
-			slices.SortFunc(result, func(a, b T) int {
-				return cmp.Compare(getID(a), getID(b))
+			slices.SortFunc(result, func(a, b resourceResult[H, P]) int {
+				return cmp.Compare(a.id, b.id)
 			})
 			if uint64(len(result)) > limit {
 				result = result[:limit]
@@ -1360,167 +1481,6 @@ func lookupResources[T any](
 		for currentDBRound >= au.cachedDBRound && currentDeltaLen == len(au.deltas) {
 			au.accountsReadCond.Wait()
 		}
-	}
-}
-
-// extractAssetDeltas populates deltaMap with asset delta entries for the given
-// address from a single round's AccountDeltas. Returns the number of holding
-// deletions found (used to over-request from DB).
-func extractAssetDeltas(accts *ledgercore.AccountDeltas, addr basics.Address, idGT basics.CreatableIndex, deltaMap map[basics.CreatableIndex]resourceDeltaEntry) int {
-	numDeleted := 0
-	for _, rec := range accts.AssetResources {
-		if rec.Addr != addr {
-			continue
-		}
-		id := basics.CreatableIndex(rec.Aidx)
-		if id <= idGT {
-			continue
-		}
-		if _, ok := deltaMap[id]; ok {
-			continue
-		}
-		// Assign typed pointers through any variables to avoid storing a
-		// typed nil (*T)(nil) in the interface, which Go considers non-nil.
-		var holding, params any
-		if rec.Holding.Holding != nil {
-			holding = rec.Holding.Holding
-		}
-		if rec.Params.Params != nil {
-			params = rec.Params.Params
-		}
-		deltaMap[id] = resourceDeltaEntry{
-			holdingOrState: holding,
-			holdingDeleted: rec.Holding.Deleted,
-			params:         params,
-			paramsDeleted:  rec.Params.Deleted,
-		}
-		if rec.Holding.Deleted {
-			numDeleted++
-		}
-	}
-	return numDeleted
-}
-
-// extractAppDeltas populates deltaMap with app delta entries for the given
-// address from a single round's AccountDeltas. Returns the number of local
-// state deletions found (used to over-request from DB).
-func extractAppDeltas(accts *ledgercore.AccountDeltas, addr basics.Address, idGT basics.CreatableIndex, deltaMap map[basics.CreatableIndex]resourceDeltaEntry) int {
-	numDeleted := 0
-	for _, rec := range accts.AppResources {
-		if rec.Addr != addr {
-			continue
-		}
-		id := basics.CreatableIndex(rec.Aidx)
-		if id <= idGT {
-			continue
-		}
-		if _, ok := deltaMap[id]; ok {
-			continue
-		}
-		var state, params any
-		if rec.State.LocalState != nil {
-			state = rec.State.LocalState
-		}
-		if rec.Params.Params != nil {
-			params = rec.Params.Params
-		}
-		deltaMap[id] = resourceDeltaEntry{
-			holdingOrState: state,
-			holdingDeleted: rec.State.Deleted,
-			params:         params,
-			paramsDeleted:  rec.Params.Deleted,
-		}
-		if rec.State.Deleted {
-			numDeleted++
-		}
-	}
-	return numDeleted
-}
-
-// mergeAssetResult builds an AssetResourceWithIDs by merging a persisted DB row
-// (nil for delta-only entries) with an optional delta override. Returns the
-// result and whether it is "live" (has at least one non-nil holding or params).
-func mergeAssetResult(id basics.CreatableIndex, pd *trackerdb.PersistedResourcesDataWithCreator, delta *resourceDeltaEntry, addr basics.Address) (ledgercore.AssetResourceWithIDs, bool) {
-	arwi := ledgercore.AssetResourceWithIDs{AssetID: basics.AssetIndex(id)}
-
-	if pd != nil {
-		if delta != nil && delta.holdingDeleted {
-			// Holding removed by delta.
-		} else if delta != nil && delta.holdingOrState != nil {
-			arwi.AssetHolding = delta.holdingOrState.(*basics.AssetHolding)
-		} else {
-			ah := pd.Data.GetAssetHolding()
-			arwi.AssetHolding = &ah
-		}
-
-		if delta != nil && delta.paramsDeleted {
-			// Params removed by delta.
-		} else if delta != nil && delta.params != nil {
-			arwi.Creator = pd.Creator
-			arwi.AssetParams = delta.params.(*basics.AssetParams)
-		} else if !pd.Creator.IsZero() {
-			arwi.Creator = pd.Creator
-			ap := pd.Data.GetAssetParams()
-			arwi.AssetParams = &ap
-		}
-	} else if delta != nil {
-		if !delta.holdingDeleted && delta.holdingOrState != nil {
-			arwi.AssetHolding = delta.holdingOrState.(*basics.AssetHolding)
-		}
-		if !delta.paramsDeleted && delta.params != nil {
-			arwi.Creator = addr
-			arwi.AssetParams = delta.params.(*basics.AssetParams)
-		}
-	}
-
-	return arwi, arwi.AssetHolding != nil || arwi.AssetParams != nil
-}
-
-// mergeAppResult returns a merge callback for application resources that
-// captures the includeParams flag. When includeParams is false, AppParams is
-// not populated (saving memory for the common case where callers only need
-// local state).
-func mergeAppResult(includeParams bool) func(basics.CreatableIndex, *trackerdb.PersistedResourcesDataWithCreator, *resourceDeltaEntry, basics.Address) (ledgercore.AppResourceWithIDs, bool) {
-	return func(id basics.CreatableIndex, pd *trackerdb.PersistedResourcesDataWithCreator, delta *resourceDeltaEntry, addr basics.Address) (ledgercore.AppResourceWithIDs, bool) {
-		arwi := ledgercore.AppResourceWithIDs{AppID: basics.AppIndex(id)}
-
-		if pd != nil {
-			if delta != nil && delta.holdingDeleted {
-				// Local state removed by delta.
-			} else if delta != nil && delta.holdingOrState != nil {
-				arwi.AppLocalState = delta.holdingOrState.(*basics.AppLocalState)
-			} else {
-				als := pd.Data.GetAppLocalState()
-				arwi.AppLocalState = &als
-			}
-
-			if delta != nil && delta.paramsDeleted {
-				// Params removed by delta.
-			} else if delta != nil && delta.params != nil {
-				arwi.Creator = pd.Creator
-				if includeParams {
-					arwi.AppResource.AppParams = delta.params.(*basics.AppParams)
-				}
-			} else if !pd.Creator.IsZero() {
-				arwi.Creator = pd.Creator
-				if includeParams {
-					ap := pd.Data.GetAppParams()
-					arwi.AppResource.AppParams = &ap
-				}
-			}
-		} else if delta != nil {
-			if !delta.holdingDeleted && delta.holdingOrState != nil {
-				arwi.AppLocalState = delta.holdingOrState.(*basics.AppLocalState)
-			}
-			if !delta.paramsDeleted && delta.params != nil {
-				arwi.Creator = addr
-				if includeParams {
-					arwi.AppResource.AppParams = delta.params.(*basics.AppParams)
-				}
-			}
-		}
-
-		return arwi, arwi.AppLocalState != nil || arwi.AppParams != nil
 	}
 }
 
